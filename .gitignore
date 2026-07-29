@@ -1,0 +1,48 @@
+# Secrets — never commit
+.env
+.env.local
+
+# ACPIA working data
+*.db
+*.db-wal
+*.db-shm
+chroma/
+memory_store/
+reports/
+
+# Evidence and demo media stay out of git
+demo_data/
+evidence/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Model weights
+*.pt
+*.pth
+*.onnx
+*.h5
+runs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Planing 
+Problem_Overview
+Proposal
+Check_list
