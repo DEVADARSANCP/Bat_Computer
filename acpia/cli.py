@@ -25,6 +25,7 @@ from .ingest import ingest_directory, ingest_file
 from .schema import RiskLevel
 from .store import Store
 from .tools import ToolLayer
+from .watchlist import AutonomyMode, Watchlist
 
 load_dotenv()
 
@@ -172,6 +173,82 @@ def cmd_audit(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_watchlist(args: argparse.Namespace) -> int:
+    store = Store(args.db)
+    if not store.case_exists(args.case_id):
+        print(f"No such case: {args.case_id}", file=sys.stderr)
+        return 1
+
+    wl = Watchlist(store, args.case_id)
+    summary = wl.summary()
+
+    print(_rule(f"WATCHLIST — {args.case_id}"))
+    print(f"autonomy mode : {summary['autonomy_mode']}")
+    print(f"tracking      : {summary['active_count']}")
+    print(f"awaiting you  : {summary['pending_approval_count']}")
+
+    if summary["active"]:
+        print("\nACTIVE:")
+        for e in summary["active"]:
+            print(f"  {e['entry_id']}  [{e['risk']:<8}] {e['type']:<10} {e['value']}")
+            print(f"                  {e['detail']}")
+
+    if summary["awaiting_approval"]:
+        print("\nAWAITING APPROVAL:")
+        for e in summary["awaiting_approval"]:
+            print(f"  {e['entry_id']}  {e['type']:<10} {e['value']}")
+            print(f"                  {e['detail']}")
+        print("\n  approve: python -m acpia.cli approve <case> <entry_id>")
+        print("  reject : python -m acpia.cli reject  <case> <entry_id>")
+    return 0
+
+
+def cmd_approve(args: argparse.Namespace) -> int:
+    store = Store(args.db)
+    result = Watchlist(store, args.case_id).approve(args.entry_id, note=args.note or "")
+    if not result.get("ok"):
+        print(result.get("error"), file=sys.stderr)
+        return 1
+    print(f"Approved — now tracking '{result['entity']}'.")
+    return 0
+
+
+def cmd_reject(args: argparse.Namespace) -> int:
+    store = Store(args.db)
+    result = Watchlist(store, args.case_id).reject(args.entry_id, note=args.note or "")
+    if not result.get("ok"):
+        print(result.get("error"), file=sys.stderr)
+        return 1
+    print(f"Rejected — '{result['entity']}' will not be tracked.")
+    return 0
+
+
+def cmd_autonomy(args: argparse.Namespace) -> int:
+    """Change how much the system may do unsupervised.
+
+    Human-only by design: there is no tool for this, so the planner cannot grant
+    itself permission to act without review.
+    """
+    store = Store(args.db)
+    if not store.case_exists(args.case_id):
+        print(f"No such case: {args.case_id}", file=sys.stderr)
+        return 1
+
+    wl = Watchlist(store, args.case_id)
+    if args.mode is None:
+        print(f"{args.case_id} autonomy mode: {wl.mode.value}")
+        return 0
+
+    wl.set_mode(AutonomyMode(args.mode))
+    print(f"{args.case_id} autonomy mode set to: {args.mode}")
+    if args.mode == AutonomyMode.AUTONOMOUS.value:
+        print("  The system will now add entities to the watchlist without asking.")
+        print("  Everything it does is still logged and reversible.")
+    else:
+        print("  The system will propose watchlist additions for your approval.")
+    return 0
+
+
 def cmd_agents(args: argparse.Namespace) -> int:
     print(_rule("REGISTERED AGENTS"))
     for agent in registry.all():
@@ -218,6 +295,30 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("case_id", nargs="?", default=None)
     audit.add_argument("--limit", type=int, default=60)
     audit.set_defaults(func=cmd_audit)
+
+    watchlist = sub.add_parser("watchlist", help="Show the case watchlist")
+    watchlist.add_argument("case_id")
+    watchlist.set_defaults(func=cmd_watchlist)
+
+    approve = sub.add_parser("approve", help="Approve a pending watchlist entry")
+    approve.add_argument("case_id")
+    approve.add_argument("entry_id")
+    approve.add_argument("--note", default=None)
+    approve.set_defaults(func=cmd_approve)
+
+    reject = sub.add_parser("reject", help="Reject a pending watchlist entry")
+    reject.add_argument("case_id")
+    reject.add_argument("entry_id")
+    reject.add_argument("--note", default=None)
+    reject.set_defaults(func=cmd_reject)
+
+    autonomy = sub.add_parser("autonomy", help="Show or set the autonomy mode (human only)")
+    autonomy.add_argument("case_id")
+    autonomy.add_argument(
+        "mode", nargs="?", choices=[m.value for m in AutonomyMode],
+        help="Omit to show the current mode.",
+    )
+    autonomy.set_defaults(func=cmd_autonomy)
 
     sub.add_parser("agents", help="List registered agents").set_defaults(func=cmd_agents)
     return parser

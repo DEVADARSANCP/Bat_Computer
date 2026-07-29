@@ -27,6 +27,7 @@ from typing import Any, Callable
 from .agents.base import AgentContext, AgentRegistry
 from .schema import EntityType, EvidenceKind, RiskLevel
 from .store import Store
+from .watchlist import PromotionReason, Watchlist
 
 
 class ToolError(Exception):
@@ -41,7 +42,12 @@ class ToolLayer:
         self.registry = registry
         self.case_id = case_id
         self.ctx = AgentContext(store=store, case_id=case_id)
+        self.watchlist = Watchlist(store, case_id)
         self.finished: dict[str, Any] | None = None
+
+    # NOTE: there is deliberately no tool for changing the autonomy mode. The
+    # planner must never be able to grant itself permission to act unsupervised.
+    # That setting is reachable only by a human, through the CLI or the UI.
 
     # ------------------------------------------------------------ discovery
 
@@ -118,7 +124,7 @@ class ToolLayer:
             }
 
         result = agent.analyse(evidence, self.ctx)
-        return {
+        payload = {
             "ok": result.ok,
             "agent": result.agent,
             "evidence": evidence.filename,
@@ -127,6 +133,28 @@ class ToolLayer:
             "error": result.error,
             "findings": [c.summary() for c in result.claims],
         }
+        promotions = self._evaluate_watchlist(result.claims)
+        if promotions:
+            payload["watchlist"] = promotions
+        return payload
+
+    def _evaluate_watchlist(self, claims) -> list[str]:
+        """Run the automatic watchlist triggers over entities an agent just produced.
+
+        This is what makes the system accumulate subjects instead of tagging each
+        file in isolation. Surfaced in the tool result so the planner sees a
+        promotion the moment it happens and can act on it in the same breath.
+        """
+        seen: set[str] = set()
+        messages: list[str] = []
+        for claim in claims:
+            for entity in claim.entities:
+                if entity.id in seen:
+                    continue
+                seen.add(entity.id)
+                for outcome in self.watchlist.evaluate(entity.id):
+                    messages.append(outcome.message)
+        return messages
 
 
 # --------------------------------------------------------------------------
@@ -152,15 +180,19 @@ def _case_overview(tools: ToolLayer, args: dict[str, Any]) -> dict[str, Any]:
             )
 
     high_risk = tools.store.get_claims(tools.case_id, min_risk=RiskLevel.MEDIUM, limit=20)
+    watchlist = tools.watchlist.summary()
 
     return {
         "case_id": tools.case_id,
+        "autonomy_mode": watchlist["autonomy_mode"],
         "evidence_total": len(evidence),
         "evidence_by_kind": _count_by(e.kind.value for e in evidence),
         "claims_total": tools.store.count_claims(tools.case_id),
         "entities_total": len(tools.store.list_entities(tools.case_id, limit=10_000)),
         "pending_analysis": pending[:25],
         "pending_count": len(pending),
+        "watchlist_active": watchlist["active"],
+        "watchlist_awaiting_approval": watchlist["awaiting_approval"],
         "elevated_risk_findings": [
             {"risk": c["risk"], "agent": c["agent"], "reason": c["reason"]} for c in high_risk
         ],
@@ -311,8 +343,10 @@ def _analyse_evidence(tools: ToolLayer, args: dict[str, Any]) -> dict[str, Any]:
         }
 
     outcomes = []
+    all_claims = []
     for agent in agents:
         result = agent.analyse(evidence, tools.ctx)
+        all_claims.extend(result.claims)
         outcomes.append(
             {
                 "agent": agent.name,
@@ -323,12 +357,48 @@ def _analyse_evidence(tools: ToolLayer, args: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
-    return {
+    payload = {
         "evidence": evidence.filename,
         "kind": evidence.kind.value,
         "agents_run": len(outcomes),
         "results": outcomes,
     }
+    promotions = tools._evaluate_watchlist(all_claims)
+    if promotions:
+        payload["watchlist"] = promotions
+    return payload
+
+
+def _watchlist_status(tools: ToolLayer, args: dict[str, Any]) -> dict[str, Any]:
+    return tools.watchlist.summary()
+
+
+def _flag_entity(tools: ToolLayer, args: dict[str, Any]) -> dict[str, Any]:
+    """Planner-initiated promotion, for judgement calls the automatic rules miss."""
+    entity_id = args.get("entity_id")
+    justification = args.get("justification")
+    if not entity_id:
+        raise ToolError("Missing required argument 'entity_id'.")
+    if not justification:
+        raise ToolError(
+            "Missing required argument 'justification'. Flagging an entity for "
+            "investigator attention always requires a stated reason."
+        )
+
+    entity = tools.store.get_entity(tools.case_id, entity_id)
+    if not entity:
+        raise ToolError(f"No entity '{entity_id}' in this case.")
+
+    outcome = tools.watchlist.propose(
+        entity_id=entity_id,
+        entity_type=entity["type"],
+        entity_value=entity["value"],
+        reason=PromotionReason.CO_OCCURRENCE,
+        detail=justification,
+        confidence=float(args.get("confidence", 0.7)),
+        proposed_by="planner",
+    )
+    return outcome.as_dict()
 
 
 def _finish_investigation(tools: ToolLayer, args: dict[str, Any]) -> dict[str, Any]:
@@ -362,6 +432,8 @@ _CASE_TOOLS: dict[str, Callable[[ToolLayer, dict[str, Any]], dict[str, Any]]] = 
     "list_entities": _list_entities,
     "entity_connections": _entity_connections,
     "analyse_evidence": _analyse_evidence,
+    "watchlist_status": _watchlist_status,
+    "flag_entity": _flag_entity,
     "finish_investigation": _finish_investigation,
 }
 
@@ -473,6 +545,42 @@ _CASE_TOOL_SCHEMAS: list[dict[str, Any]] = [
                 }
             },
             "required": ["entity_id"],
+        },
+    },
+    {
+        "name": "watchlist_status",
+        "description": (
+            "Show the case watchlist — the entities this investigation is actively tracking "
+            "(people, vehicles, plates, handles), plus anything awaiting investigator approval "
+            "and the current autonomy mode. Entities reach the watchlist automatically when "
+            "they recur across evidence, co-occur with something already tracked, or match an "
+            "earlier case. Check this to know WHO AND WHAT YOU ARE LOOKING FOR before "
+            "examining new evidence. "
+            "Keywords: watchlist, tracking, suspects, subjects, shortlist, who am I looking for."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "flag_entity",
+        "description": (
+            "Put an entity on the watchlist because YOU judge it significant, when the "
+            "automatic rules have not already done so. Use sparingly and only with a real "
+            "reason — for example an entity that links two otherwise unconnected pieces of "
+            "evidence. In supervised mode this is a PROPOSAL the investigator must approve; "
+            "in autonomous mode it takes effect immediately. Either way it is logged. "
+            "Keywords: flag, mark, track this, add to watchlist, this looks important."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "entity_id": {"type": "string", "description": "Entity to flag."},
+                "justification": {
+                    "type": "string",
+                    "description": "Why this entity warrants investigator attention.",
+                },
+                "confidence": {"type": "number", "description": "0-1 confidence."},
+            },
+            "required": ["entity_id", "justification"],
         },
     },
     {
