@@ -62,6 +62,8 @@ class RelationType(str, Enum):
     DEPICTS = "depicts"  # evidence -> person/object
     TRAVELLED_TO = "travelled_to"  # person/vehicle -> location
     MATCHES = "matches"  # entity -> entity (cross-source identity link)
+    CARRYING = "carrying"  # person -> object (bag, case, worn item)
+    NEAR = "near"  # entity -> entity, co-located in one frame
 
 
 class ClaimKind(str, Enum):

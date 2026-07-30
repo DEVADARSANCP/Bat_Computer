@@ -144,6 +144,66 @@ CREATE TABLE IF NOT EXISTS case_settings (
     value   TEXT NOT NULL,
     PRIMARY KEY (case_id, key)
 );
+
+-- Every face instance ever detected. `face_id` groups instances judged to be
+-- the same person, so re-identification is just "which face_id did this get".
+CREATE TABLE IF NOT EXISTS face_instances (
+    instance_id TEXT PRIMARY KEY,
+    case_id     TEXT NOT NULL,
+    face_id     TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
+    locator     TEXT NOT NULL,
+    embedding   BLOB NOT NULL,
+    det_score   REAL NOT NULL,
+    quality     REAL NOT NULL,
+    is_small    INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_face_case ON face_instances(case_id, face_id);
+CREATE INDEX IF NOT EXISTS idx_face_evidence ON face_instances(evidence_id);
+
+-- People the investigator has enrolled. case_id NULL means the entry is global
+-- and visible to every case (the prior-suspect gallery).
+CREATE TABLE IF NOT EXISTS person_register (
+    person_id    TEXT PRIMARY KEY,
+    case_id      TEXT,
+    name         TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    relationship TEXT,
+    enrolled_by  TEXT NOT NULL,
+    enrolled_at  TEXT NOT NULL,
+    notes        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_register_case ON person_register(case_id, status);
+
+-- Every carried-object sighting. `object_id` groups sightings judged to be the
+-- SAME physical object, which is what turns "a bag" into "V's bag, now carried
+-- by someone else".
+CREATE TABLE IF NOT EXISTS object_instances (
+    instance_id TEXT PRIMARY KEY,
+    case_id     TEXT NOT NULL,
+    object_id   TEXT NOT NULL,
+    label       TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
+    locator     TEXT NOT NULL,
+    signature   BLOB NOT NULL,
+    width       INTEGER NOT NULL,
+    height      INTEGER NOT NULL,
+    holder_id   TEXT,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_object_case ON object_instances(case_id, object_id);
+CREATE INDEX IF NOT EXISTS idx_object_evidence ON object_instances(evidence_id);
+
+CREATE TABLE IF NOT EXISTS person_reference_faces (
+    ref_id      TEXT PRIMARY KEY,
+    person_id   TEXT NOT NULL,
+    embedding   BLOB NOT NULL,
+    source_path TEXT,
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (person_id) REFERENCES person_register(person_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_refface_person ON person_reference_faces(person_id);
 """
 
 
@@ -562,6 +622,179 @@ class Store:
                 "SELECT * FROM watchlist WHERE case_id=? ORDER BY added_at", (case_id,)
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ---------------------------------------------------------- face gallery
+
+    def add_face_instance(
+        self,
+        *,
+        case_id: str,
+        face_id: str,
+        evidence_id: str,
+        locator: str,
+        embedding: bytes,
+        det_score: float,
+        quality: float,
+        is_small: bool,
+    ) -> str:
+        instance_id = f"fi_{uuid.uuid4().hex[:12]}"
+        self.conn.execute(
+            """INSERT INTO face_instances
+               (instance_id, case_id, face_id, evidence_id, locator, embedding,
+                det_score, quality, is_small, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                instance_id, case_id, face_id, evidence_id, locator, embedding,
+                det_score, quality, int(is_small), _now_iso(),
+            ),
+        )
+        self.conn.commit()
+        return instance_id
+
+    def list_face_instances(self, case_id: str) -> list[dict[str, Any]]:
+        """Every face instance in a case. Used as the gallery to match against."""
+        rows = self.conn.execute(
+            "SELECT * FROM face_instances WHERE case_id=? ORDER BY created_at", (case_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_face_identities(self, case_id: str) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(DISTINCT face_id) AS n FROM face_instances WHERE case_id=?",
+            (case_id,),
+        ).fetchone()
+        return row["n"] if row else 0
+
+    def face_id_evidence_count(self, case_id: str, face_id: str) -> int:
+        row = self.conn.execute(
+            """SELECT COUNT(DISTINCT evidence_id) AS n FROM face_instances
+               WHERE case_id=? AND face_id=?""",
+            (case_id, face_id),
+        ).fetchone()
+        return row["n"] if row else 0
+
+    # -------------------------------------------------------- object gallery
+
+    def add_object_instance(
+        self,
+        *,
+        case_id: str,
+        object_id: str,
+        label: str,
+        evidence_id: str,
+        locator: str,
+        signature: bytes,
+        width: int,
+        height: int,
+        holder_id: str | None = None,
+    ) -> str:
+        instance_id = f"oi_{uuid.uuid4().hex[:12]}"
+        self.conn.execute(
+            """INSERT INTO object_instances
+               (instance_id, case_id, object_id, label, evidence_id, locator,
+                signature, width, height, holder_id, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                instance_id, case_id, object_id, label, evidence_id, locator,
+                signature, width, height, holder_id, _now_iso(),
+            ),
+        )
+        self.conn.commit()
+        return instance_id
+
+    def list_object_instances(
+        self, case_id: str, label: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Object sightings, optionally restricted to one class.
+
+        Filtering by label matters: comparing a backpack against a car crop is
+        wasted work and a source of spurious matches.
+        """
+        if label:
+            rows = self.conn.execute(
+                """SELECT * FROM object_instances WHERE case_id=? AND label=?
+                   ORDER BY created_at""",
+                (case_id, label),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM object_instances WHERE case_id=? ORDER BY created_at",
+                (case_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def object_id_sightings(self, case_id: str, object_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """SELECT * FROM object_instances WHERE case_id=? AND object_id=?
+               ORDER BY created_at""",
+            (case_id, object_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # -------------------------------------------------------- person register
+
+    def enroll_person(
+        self,
+        *,
+        name: str,
+        status: str,
+        case_id: str | None,
+        relationship: str | None = None,
+        enrolled_by: str = "human",
+        notes: str | None = None,
+    ) -> str:
+        person_id = f"per_{uuid.uuid4().hex[:12]}"
+        self.conn.execute(
+            """INSERT INTO person_register
+               (person_id, case_id, name, status, relationship, enrolled_by, enrolled_at, notes)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (person_id, case_id, name, status, relationship, enrolled_by, _now_iso(), notes),
+        )
+        self.conn.commit()
+        return person_id
+
+    def add_reference_face(self, person_id: str, embedding: bytes, source_path: str = "") -> str:
+        ref_id = f"ref_{uuid.uuid4().hex[:12]}"
+        self.conn.execute(
+            """INSERT INTO person_reference_faces
+               (ref_id, person_id, embedding, source_path, created_at)
+               VALUES (?,?,?,?,?)""",
+            (ref_id, person_id, embedding, source_path, _now_iso()),
+        )
+        self.conn.commit()
+        return ref_id
+
+    def list_register(self, case_id: str | None = None) -> list[dict[str, Any]]:
+        """Enrolled people visible to a case: its own entries plus global ones."""
+        if case_id is None:
+            rows = self.conn.execute("SELECT * FROM person_register").fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM person_register WHERE case_id=? OR case_id IS NULL",
+                (case_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_reference_faces(self, case_id: str | None = None) -> list[dict[str, Any]]:
+        """Reference embeddings joined to their person, scoped like list_register."""
+        if case_id is None:
+            sql = """SELECT rf.*, pr.name, pr.status, pr.relationship, pr.case_id
+                     FROM person_reference_faces rf
+                     JOIN person_register pr ON pr.person_id = rf.person_id"""
+            rows = self.conn.execute(sql).fetchall()
+        else:
+            sql = """SELECT rf.*, pr.name, pr.status, pr.relationship, pr.case_id
+                     FROM person_reference_faces rf
+                     JOIN person_register pr ON pr.person_id = rf.person_id
+                     WHERE pr.case_id = ? OR pr.case_id IS NULL"""
+            rows = self.conn.execute(sql, (case_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_person(self, person_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM person_register WHERE person_id=?", (person_id,)
+        ).fetchone()
+        return dict(row) if row else None
 
     # -------------------------------------------------------- case settings
 
