@@ -249,6 +249,219 @@ def cmd_autonomy(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_enroll(args: argparse.Namespace) -> int:
+    """Enrol a known person. Human-only — there is deliberately no tool for this."""
+    from .persons import PersonRegister, PersonStatus
+
+    store = Store(args.db)
+    if not store.case_exists(args.case_id):
+        store.create_case(args.case_id, name=f"Case {args.case_id}")
+
+    register = PersonRegister(store, args.case_id)
+    try:
+        status = PersonStatus(args.status)
+    except ValueError:
+        print(f"Invalid status: {args.status}", file=sys.stderr)
+        return 1
+
+    result = register.enroll(
+        args.name,
+        status,
+        args.photo,
+        relationship=args.relationship,
+        global_entry=args.global_entry,
+        notes=args.note,
+    )
+
+    if result["references_accepted"]:
+        scope = "globally (visible to all cases)" if args.global_entry else f"in {args.case_id}"
+        print(f"Enrolled '{args.name}' as {status.value} {scope}")
+        print(f"  reference faces accepted: {result['references_accepted']}")
+    else:
+        print(f"Enrolment FAILED for '{args.name}' — no usable reference face.", file=sys.stderr)
+
+    for rejected in result["rejected"]:
+        print(f"  rejected: {rejected}", file=sys.stderr)
+    return 0 if result["references_accepted"] else 1
+
+
+def cmd_register(args: argparse.Namespace) -> int:
+    from .persons import PersonRegister
+
+    store = Store(args.db)
+    summary = PersonRegister(store, args.case_id).summary()
+
+    print(_rule(f"PERSON REGISTER — {args.case_id}"))
+    if not summary["people"]:
+        print("Nobody enrolled yet.")
+        print("\n  python -m acpia.cli enroll CASE-001 --name \"Anna\" --status victim \\")
+        print("         --photo .\\data\\reference\\victim.jpg")
+        return 0
+
+    for person in summary["people"]:
+        rel = f" ({person['relationship']})" if person["relationship"] else ""
+        print(f"  {person['status']:<20} {person['name']}{rel}   [{person['scope']}]")
+    return 0
+
+
+def cmd_calibrate_faces(args: argparse.Namespace) -> int:
+    """Measure the actual face-similarity separation on real data.
+
+    Thresholds should be derived from evidence, not inherited from a tutorial.
+    Point this at a folder of real footage and it reports where the boundary
+    between "same person" and "different person" actually falls.
+    """
+    import itertools
+    from pathlib import Path as _Path
+
+    import numpy as np
+
+    from .faces import FACE_MATCH_STRONG, FACE_MATCH_WEAK, cosine_similarity, detect_faces
+
+    folder = _Path(args.folder)
+    images = sorted(
+        p for p in folder.rglob("*") if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+    )
+    if not images:
+        print(f"No images found in {folder}", file=sys.stderr)
+        return 1
+
+    print(f"Scanning {len(images)} images...")
+    per_image: dict[str, list] = {}
+    for path in images:
+        try:
+            faces = detect_faces(path)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  skipped {path.name}: {exc}", file=sys.stderr)
+            continue
+        if faces:
+            per_image[path.name] = faces
+
+    total = sum(len(v) for v in per_image.values())
+    print(f"{total} faces across {len(per_image)} images\n")
+
+    # Two faces in one photograph are necessarily different people, which gives a
+    # free sample of the different-person distribution with no labelling needed.
+    different = [
+        cosine_similarity(a.embedding, b.embedding)
+        for faces in per_image.values()
+        for a, b in itertools.combinations(faces, 2)
+    ]
+
+    if not different:
+        print("No multi-face images — cannot estimate the different-person distribution.")
+        print("Add some group photos and re-run.")
+        return 0
+
+    arr = np.array(different)
+    print(_rule("DIFFERENT-PERSON SIMILARITY (same photo, so definitely different people)"))
+    print(f"  samples : {len(arr)}")
+    print(f"  median  : {np.percentile(arr, 50):.3f}")
+    print(f"  p95     : {np.percentile(arr, 95):.3f}")
+    print(f"  max     : {arr.max():.3f}   <-- the false-positive ceiling")
+    print()
+    print(f"  current weak threshold   : {FACE_MATCH_WEAK:.2f}")
+    print(f"  current strong threshold : {FACE_MATCH_STRONG:.2f}")
+    print()
+
+    margin = FACE_MATCH_WEAK - arr.max()
+    if margin > 0.10:
+        print(f"  OK — {margin:.2f} of headroom above the worst different-person pair.")
+    elif margin > 0:
+        print(f"  TIGHT — only {margin:.2f} of headroom. Consider raising the weak threshold.")
+    else:
+        print("  UNSAFE — different people score above the weak threshold. Raise it.")
+    return 0
+
+
+def cmd_calibrate_objects(args: argparse.Namespace) -> int:
+    """Measure instance-matching separation on real object crops.
+
+    Point at a folder where the SAME distinctive object appears in several
+    photographs. Reports whether the current thresholds actually separate it
+    from other objects of the same class.
+    """
+    import itertools
+    from pathlib import Path as _Path
+
+    import cv2
+    import numpy as np
+
+    from .appearance import (
+        CLIP_STRONG,
+        CLIP_WEAK,
+        COLOUR_STRONG,
+        COLOUR_WEAK,
+        compare,
+        signature_for,
+    )
+    from .detection import CARRIED_CLASSES, detect_objects
+
+    folder = _Path(args.folder)
+    images = sorted(
+        p for p in folder.rglob("*") if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+    )
+    if not images:
+        print(f"No images found in {folder}", file=sys.stderr)
+        return 1
+
+    wanted = set(CARRIED_CLASSES.values())
+    crops: list[tuple[str, str, object]] = []
+
+    print(f"Scanning {len(images)} images for carried items...")
+    for path in images:
+        image = cv2.imread(str(path))
+        if image is None:
+            continue
+        for detection in detect_objects(str(path)):
+            if detection.label not in wanted:
+                continue
+            signature = signature_for(image, detection.bbox)
+            if signature and not signature.is_small:
+                crops.append((path.name, detection.label, signature))
+
+    if len(crops) < 2:
+        print(f"Only {len(crops)} usable object crops found — need at least 2.")
+        print("This calibration needs photos containing backpacks, handbags or suitcases.")
+        return 0
+
+    print(f"{len(crops)} object crops\n")
+    print(_rule("PAIRWISE SIMILARITY (same class only)"))
+    print(f"{'file A':<22} {'file B':<22} {'clip':>6} {'colour':>7}  verdict")
+    print("-" * 74)
+
+    rows = []
+    for (na, la, sa), (nb, lb, sb) in itertools.combinations(crops, 2):
+        if la != lb:
+            continue
+        _, clip_similarity, colour_similarity = compare(sa, sb)
+        if clip_similarity >= CLIP_STRONG and colour_similarity >= COLOUR_STRONG:
+            verdict = "SAME OBJECT"
+        elif clip_similarity >= CLIP_WEAK and colour_similarity >= COLOUR_WEAK:
+            verdict = "possible"
+        else:
+            verdict = "different"
+        rows.append((clip_similarity, colour_similarity, verdict))
+        print(
+            f"{na[:21]:<22} {nb[:21]:<22} {clip_similarity:6.3f} "
+            f"{colour_similarity:7.3f}  {verdict}"
+        )
+
+    if rows:
+        clips = np.array([r[0] for r in rows])
+        colours = np.array([r[1] for r in rows])
+        print()
+        print(f"clip   range {clips.min():.3f} – {clips.max():.3f}")
+        print(f"colour range {colours.min():.3f} – {colours.max():.3f}")
+        print()
+        print(f"current rule: SAME requires clip>={CLIP_STRONG} AND colour>={COLOUR_STRONG}")
+        print(f"              possible     clip>={CLIP_WEAK} AND colour>={COLOUR_WEAK}")
+        print()
+        print("Check the verdicts against what you know. If pairs you know are the")
+        print("same object read 'different', lower the thresholds in acpia/appearance.py.")
+    return 0
+
+
 def cmd_agents(args: argparse.Namespace) -> int:
     print(_rule("REGISTERED AGENTS"))
     for agent in registry.all():
@@ -319,6 +532,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="Omit to show the current mode.",
     )
     autonomy.set_defaults(func=cmd_autonomy)
+
+    enroll = sub.add_parser("enroll", help="Enrol a known person (human only)")
+    enroll.add_argument("case_id")
+    enroll.add_argument("--name", required=True)
+    enroll.add_argument(
+        "--status", required=True,
+        choices=["victim", "person_of_interest", "known_associate"],
+    )
+    enroll.add_argument(
+        "--photo", required=True, nargs="+",
+        help="One or more reference photos. Each must contain exactly one face.",
+    )
+    enroll.add_argument("--relationship", default=None, help="e.g. father, sister, teacher")
+    enroll.add_argument(
+        "--global", dest="global_entry", action="store_true",
+        help="Visible to all cases — use for the prior-suspect gallery.",
+    )
+    enroll.add_argument("--note", default=None)
+    enroll.set_defaults(func=cmd_enroll)
+
+    register = sub.add_parser("register", help="Show enrolled people")
+    register.add_argument("case_id")
+    register.set_defaults(func=cmd_register)
+
+    calibrate = sub.add_parser(
+        "calibrate-faces", help="Measure real face-similarity separation on a folder"
+    )
+    calibrate.add_argument("folder")
+    calibrate.set_defaults(func=cmd_calibrate_faces)
+
+    calibrate_obj = sub.add_parser(
+        "calibrate-objects", help="Measure object instance-matching separation on a folder"
+    )
+    calibrate_obj.add_argument("folder")
+    calibrate_obj.set_defaults(func=cmd_calibrate_objects)
 
     sub.add_parser("agents", help="List registered agents").set_defaults(func=cmd_agents)
     return parser
