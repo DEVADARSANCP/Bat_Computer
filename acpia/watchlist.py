@@ -225,6 +225,27 @@ class Watchlist:
 
     # ---------------------------------------------------- automatic triggers
 
+    def _suppressed_by_register(self, entity: dict[str, Any]) -> str | None:
+        """Whether this entity is someone the investigator has already accounted for.
+
+        Returns a human-readable reason when recurrence should NOT promote them.
+
+        This is the fix for frequency-based triage being biased toward the
+        innocent: the faces that recur most in a victim's photographs are family
+        and friends. Enrolled people are still fully analysed and still escalate
+        on a real signal — co-occurrence with something flagged, a cross-case hit,
+        or a manual flag. They simply do not reach the watchlist for the crime of
+        appearing often.
+        """
+        status = (entity.get("attributes") or {}).get("register_status")
+        name = (entity.get("attributes") or {}).get("register_name") or entity["value"]
+
+        if status == "known_associate":
+            return f"'{name}' is an enrolled known associate — frequent appearances are expected."
+        if status == "victim":
+            return f"'{name}' is the enrolled victim — appearing throughout the evidence is expected."
+        return None
+
     def check_recurrence(self, entity_id: str) -> PromotionOutcome | None:
         """Promote an entity that has turned up in enough separate evidence items."""
         entity = self.store.get_entity(self.case_id, entity_id)
@@ -235,6 +256,16 @@ class Watchlist:
         if sources < self.recurrence_threshold:
             return None
         if self.store.get_watchlist_entry(self.case_id, entity_id):
+            return None
+
+        suppressed = self._suppressed_by_register(entity)
+        if suppressed:
+            self.store.audit(
+                self.case_id,
+                actor="watchlist",
+                action="recurrence_suppressed",
+                detail={"entity_id": entity_id, "sightings": sources, "reason": suppressed},
+            )
             return None
 
         return self.propose(
